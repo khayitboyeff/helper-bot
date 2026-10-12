@@ -1,0 +1,104 @@
+"""Gemini AI bilan suhbat: kuniga 200 so'rov, kontekstli chat."""
+from aiogram import Router, F
+from aiogram.filters import Command
+from aiogram.types import Message
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from google import genai
+from google.genai import types
+from config import config
+from database.db import db
+from utils.logger import logger
+
+router = Router(name="gemini_chat")
+
+class GeminiState(StatesGroup):
+    chatting = State()
+
+@router.message(F.text == "🤖 Gemini AI")
+async def start_chat(message: Message, state: FSMContext):
+    await state.set_state(GeminiState.chatting)
+    await state.update_data(gemini_history=[])
+    await message.answer("🤖 <b>Gemini AI suhbat</b>\nSavolingizni yozing. Kunlik bepul limit — 200 ta so'rov. Suhbatni to'xtatish uchun /start bosing.")
+
+@router.message(GeminiState.chatting, F.text, ~F.text.startswith("/"))
+async def chat(message: Message, state: FSMContext):
+    if not config.GEMINI_API_KEY:
+        await message.answer("⚠️ Gemini API hali sozlanmagan. Admin .env faylida GEMINI_API_KEY ni kiritsin.")
+        return
+await db.check_and_expire_vip(message.from_user.id)
+user = await db.get_user(message.from_user.id)
+is_pro = bool(user and user.get("vip"))
+
+used = 0
+limit = config.GEMINI_DAILY_LIMIT
+
+if not is_pro:
+    used = await db.get_gemini_daily_usage(message.from_user.id)
+    if used >= limit:
+        await message.answer(
+            f"⛔ Bugungi bepul AI limitingiz ({limit} ta) tugadi.\n\n"
+            "💎 Cheksiz AI muloqoti uchun /vip orqali PRO oling."
+        )
+        return
+    try:
+        data = await state.get_data()
+        history = data.get("gemini_history", [])[-12:]
+        client = genai.Client(api_key=config.GEMINI_API_KEY)
+        contents = []
+        for item in history:
+            contents.append(types.Content(role=item["role"], parts=[types.Part.from_text(text=item["text"])]))
+        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=message.text.strip())]))
+        response = await client.aio.models.generate_content(
+            model=config.GEMINI_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction="Sen Yordamchi Bot ichidagi foydali, muloyim va aniq AI yordamchisan. Foydalanuvchiga uning tilida javob ber, odatda o'zbek tilida. Kerak bo'lsa kod va bosqichma-bosqich tushuntirish ber.",
+                temperature=0.7,
+            ),
+        )
+        answer = (response.text or "Javob tayyorlab bo'lmadi. Boshqacha so'rab ko'ring.").strip()
+        await db.increment_gemini_daily_usage(message.from_user.id)
+        history.extend([
+            {"role": "user", "text": message.text.strip()},
+            {"role": "model", "text": answer},
+        ])
+        await state.update_data(gemini_history=history[-12:])
+        # Telegram xabar limiti uchun javobni bo'lib yuborish
+        await status.delete()
+        for i in range(0, len(answer), 3900):
+            await message.answer(answer[i:i+3900])
+        left = max(0, limit - used - 1)
+        if left <= 10:
+            await message.answer(f"ℹ️ Bugun yana {left} ta so'rov qoldi. Limit tugasa, 💎 PRO obunani /vip orqali ko'ring.")
+    except Exception as exc:
+        # Konsolda aniq sabab saqlanadi; foydalanuvchiga xavfsiz, amaliy yo'l-yo'riq ko'rsatiladi.
+        logger.exception("Gemini chat xatosi: %s", exc)
+        err = str(exc).lower()
+        if any(term in err for term in ("api key not valid", "invalid api key", "unauthorized", "api_key_invalid", "401")):
+            hint = (
+                "❌ Gemini API kaliti noto'g'ri yoki bekor qilingan.\n\n"
+                "Google AI Studio'dan yangi API key oling va loyiha papkasidagi .env fayliga "
+                "GEMINI_API_KEY=YANGI_KALIT ko'rinishida kiriting. Kalitni qo'shtirnoqqa olmang."
+            )
+        elif any(term in err for term in ("permission_denied", "permission denied", "403", "forbidden")):
+            hint = (
+                "❌ API kalitiga ruxsat berilmagan. Google AI Studio'da aynan shu loyiha uchun kalit oling; "
+                "Google Cloud'da Gemini API yoqilganini va kalit cheklovlarini tekshiring."
+            )
+        elif any(term in err for term in ("not found", "404", "model")):
+            hint = (
+                f"❌ Model topilmadi yoki unga ruxsat yo'q (hozirgi model: {config.GEMINI_MODEL}). "
+                " .env ichida GEMINI_MODEL=gemini-2.5-flash deb tekshiring."
+            )
+        elif any(term in err for term in ("quota", "resource_exhausted", "429", "rate limit")):
+            hint = "⏳ Gemini API kvotasi yoki tezlik limiti tugagan. Google AI Studio'dagi Usage/Quota bo'limini tekshiring."
+        else:
+            hint = (
+                "❌ Gemini bilan bog'lanib bo'lmadi. Internetni tekshiring. Aniq sabab terminaldagi xato logida yoziladi.\n"
+                "API keyni hech kimga yubormang."
+            )
+        try:
+            await status.edit_text(hint)
+        except Exception:
+            await message.answer(hint)
